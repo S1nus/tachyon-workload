@@ -7,15 +7,20 @@ mock proofs and unencrypted keys**, not a production wallet or proof service.
 
 ## Setup
 
-The tested devtool revision is recorded in `DEVTOOL_REVISION`. Build its
+The compatible devtool source revision is recorded in `DEVTOOL_REVISION`. Build its
 `tachyon` feature as described in the
-[wallet guide](https://github.com/S1nus/zcash-devtool/blob/d651c3cc3c9abeef071936fa708228ebc71aee20/doc/tachyon.md).
+[wallet guide](https://github.com/S1nus/zcash-devtool/blob/0394ba0aeb95bd003f756bb073f3aa80f76279f2/doc/tachyon.md).
+That pinned guide still mentions `ROCKSDB_LIB_DIR` and the removed
+`tachyon_workload` mining option; omit both when following it.
 The sidecar invokes the resulting binary; it does not import or modify devtool.
-Use Rust 1.97.1 for that build:
+The pin includes bounded QR buckets; it is a source compatibility baseline, not
+a claim that a node-backed smoke run has passed on your network. Check it out
+explicitly in a clean checkout; its toolchain file selects Rust 1.97.1:
 
 ```sh
 cd ../zcash-devtool
-ROCKSDB_LIB_DIR="/opt/homebrew/lib" CARGO_INCREMENTAL=0 \
+git checkout 0394ba0aeb95bd003f756bb073f3aa80f76279f2
+CARGO_INCREMENTAL=0 \
   RUSTFLAGS='--cfg zcash_unstable="nutachyon"' \
   cargo build --release --locked --features tachyon
 cd ../tachyon-workload
@@ -37,9 +42,12 @@ This reuses `treasury` within `wallet_root`, or creates it if missing, and creat
 the numbered
 `sim-001` through `sim-032` wallets. It prints the treasury's `miner_address`.
 Existing wallets must match the RPC's genesis and NuTachyon activation block.
-Configure the node with that address, `internal_miner = true`, and
-**`tachyon_workload = false`**; the old node-side output generator replaces normal
-mempool selection. Wait 100 confirmations for rewards. Do not reset the chain.
+Configure `mining.miner_address` with that address and use
+`internal_miner = true` for live mode. The node revision used for this check,
+`ec58f4bb797d2ad0390a157e175bc94c09ad979e`, rejects unknown mining
+configuration fields. Adding the historical `tachyon_workload` option prevents
+the node from starting. Wait 100 confirmations
+for rewards. Do not reset the chain.
 
 For a small smoke run, set `wallet_count = 4`, `max_transactions = 4`. Wallets
 sync independently from activation; their initial synchronization over a remote
@@ -83,8 +91,7 @@ can carry into later blocks. A zero round does not promise a coinbase-only block
 Node-side aggregation remains Zakura's responsibility.
 
 For deterministic batches on a PoW-disabled custom network, turn off
-`internal_miner` and all other miners/producers, keep `tachyon_workload = false`,
-and use:
+`internal_miner` and all other miners/producers, and use:
 
 ```sh
 python3 -m tachyon_workload --config config.local.toml --accept-test-funds \
@@ -149,9 +156,38 @@ or miner-address change is needed.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest tachyon_workload.test_workload -v
+  python3 -m unittest discover -v
 ```
 
 Tests cover weighted selection, maturity, coinbase constraints, epoch boundaries,
 zero rounds, private directories, journal locking and chain identity, reorg
 recovery, ambiguous broadcasting/receipt delivery, and mining timeout recovery.
+
+### CLI compatibility smoke
+
+After building the pinned binary, check the command help and required arguments
+used by the sidecar:
+
+```sh
+python3 -m tachyon_workload.compatibility ../zcash-devtool/target/release/zcash-devtool
+```
+
+This read-only check invokes help only: it never creates wallets or submits
+transactions. It establishes CLI shape compatibility, not RPC or proof correctness.
+No CLI-facing files changed between these pins; this is a guard for future changes.
+It reports all command mismatches and timeouts together; an unavailable executable
+stops the check immediately.
+The pinned devtool already includes a regression that spends after an epoch with
+more than 8,191 members. Run it in the devtool checkout to exercise the QR path:
+
+```sh
+RUSTFLAGS='--cfg zcash_unstable="nutachyon"' \
+  cargo test --locked -p tachyon-wallet --lib \
+  tests::spends_after_epoch_with_more_tachygrams_than_polynomial_capacity -- --exact
+```
+
+This uses the mock prover and does not measure production proving performance.
+Node-backed small controlled rounds and epoch crossing remain a separate manual
+integration check requiring an isolated compatible node. The Python test suite
+runs without network, keys, a Rust build, or a node. The help check does not
+verify the binary source revision; build the pinned checkout above.
