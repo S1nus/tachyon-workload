@@ -21,3 +21,11 @@ send = 80
 unshield = 8
 shield = 8
 transparent-send = 4
+
+# Optional external testnet transparent faucet (never a simulation wallet).
+# Uncomment the whole section and supply your own address to enable it.
+# [faucet]
+# address = "YOUR_TESTNET_TRANSPARENT_ADDRESS"
+# reward_share_bps = 1000       # 10% of coinbase outputs actually paid to treasury
+# payout_interval_blocks = 10  # batches of rewards, after 100 confirmations
+# min_payout_zat = 100000      # smaller amounts remain owed; fees paid by treasury

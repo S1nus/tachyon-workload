@@ -7,7 +7,7 @@ def available_notes(balance):
     return sorted(note["value_zat"] for note in balance["notes"] if note["status"] == "available")
 
 
-def funding_payment(config, balances, utxos, addresses, busy):
+def funding_payment(config, balances, utxos, addresses, busy, protected_zat=0):
     if "treasury" in busy:
         return None
     needy = []
@@ -25,7 +25,8 @@ def funding_payment(config, balances, utxos, addresses, busy):
     count, recipient = min(needy)
     # Different denominations give the single-input wallet usable choices.
     amount = config["seed_amount_zat"] * (1 + count)
-    if any(note >= amount + FEE for note in available_notes(balances["treasury"])):
+    notes = available_notes(balances["treasury"])
+    if sum(notes) >= amount + FEE + protected_zat and any(note >= amount + FEE for note in notes):
         return ("treasury", recipient, ["send", "--to", addresses[recipient]["tachyon_address"],
                                          "--amount-zat", str(amount)])
     for utxo in utxos.get("treasury", []):

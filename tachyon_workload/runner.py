@@ -7,6 +7,7 @@ import os
 import random
 
 from .planner import choose_payment, funding_payment
+from .faucet import Faucet
 from .runtime import CliError, Devtool, Journal, Rpc, emit, private_dir
 
 
@@ -14,12 +15,14 @@ class Runner:
     def __init__(self, config, seed=None):
         self.config = config
         self.journal = Journal(config["state_dir"])
+        self.faucet = Faucet(self.journal, config.get("faucet"))
         self.receipts = private_dir(config["state_dir"] / "receipts")
         self.rpc = Rpc(config)
         self.cli = Devtool(config)
         self.rng = random.Random(seed)
         self.wallets = ["treasury"] + [f"sim-{i:03}" for i in range(1, config["wallet_count"] + 1)]
         self.addresses = {}
+        self.wallet_tips = {}
         self.journal.pin("wallet_root", str(config["wallet_root"]))
 
     async def network(self):
@@ -38,7 +41,7 @@ class Runner:
         return info, identity
 
     async def initialize(self, create=False):
-        _, identity = await self.network()
+        info, identity = await self.network()
         private_dir(self.config["wallet_root"])
         for wallet in self.wallets:
             directory = self.config["wallet_root"] / wallet
@@ -56,6 +59,7 @@ class Runner:
                 raise RuntimeError(f"{wallet} belongs to a different chain; refusing to spend")
             self.journal.pin("address:" + wallet, address["funding_address"])
             self.addresses[wallet] = address
+        self.faucet.initialize(info["blocks"], info["bestblockhash"], self.addresses)
         emit("ready", wallets=len(self.wallets), miner_address=self.addresses["treasury"]["funding_address"],
              network_id=identity)
 
@@ -65,10 +69,18 @@ class Runner:
             balance = await self.cli.call(wallet, "balance")
             transactions = await self.cli.call(wallet, "transactions")
             self.journal.reconcile(wallet, transactions["transactions"])
+            self.wallet_tips[wallet] = (synced["height"], synced["hash"])
             emit("synced", wallet=wallet, height=synced["height"], tachyon_zat=balance["available_zat"],
                  transparent_available_zat=(balance.get("transparent") or {}).get("available_zat"))
             return wallet, balance
         return dict(await asyncio.gather(*(wallet_snapshot(wallet) for wallet in self.wallets)))
+
+    async def sync_faucet(self):
+        if not self.faucet.tracked:
+            return True
+        caught_up = await self.faucet.sync(self.rpc, *self.wallet_tips["treasury"])
+        emit("faucet", **self.faucet.status())
+        return caught_up
 
     async def funding_utxos(self, busy):
         # Only probe idle wallets. The wallet independently validates ownership,
@@ -142,6 +154,12 @@ class Runner:
                 await self.cli.call(operation["wallet"], "submit", "--txid", saved["txid"])
         emit("payment", wallet=operation["wallet"], kind=operation["kind"], txid=saved["txid"],
              operation_id=operation["id"], status=saved["status"])
+        faucet = self.journal.db.execute("SELECT * FROM faucet_operations WHERE operation_id=?",
+                                        (operation["id"],)).fetchone()
+        if faucet:
+            emit("faucet_payment", purpose=faucet["purpose"], policy_id=faucet["policy_id"],
+                 amount_zat=faucet["amount_zat"], txid=saved["txid"], status=saved["status"],
+                 operation_id=operation["id"])
 
     async def recover(self):
         for operation in self.journal.unfinished():
@@ -182,6 +200,8 @@ class Runner:
     async def round(self, mode, bootstrap=False):
         await self.network()
         balances = await self.snapshot()
+        if not await self.sync_faucet():
+            return False  # Bounded historical scan; do not spend against incomplete accounting.
         await self.recover()
         active = self.journal.active_rounds()
         if active:
@@ -208,7 +228,12 @@ class Runner:
             feed = await self.rpc.call("gettachyonblock", [str(height)])
             tachyon_allowed = (feed["poolHeight"] + 1) % feed["epochLength"] != 0
             payments = []
-            funding = funding_payment(self.config, balances, utxos, self.addresses, busy)
+            faucet_payment = self.faucet.payment(balances, utxos, busy, tachyon_allowed)
+            if faucet_payment:
+                payments.append(faucet_payment[0])
+                busy.add("treasury")
+            funding = funding_payment(self.config, balances, utxos, self.addresses, busy,
+                                      self.faucet.protected_zat())
             if funding and tachyon_allowed:
                 payments.append(funding)
                 busy.add("treasury")
@@ -223,7 +248,9 @@ class Runner:
                     if payment:
                         payments.append(payment)
             # Entire batch is durable before any child process can broadcast.
-            operations = [self.journal.plan(round_id, *payment) for payment in payments]
+            operations = [self.journal.plan(round_id, *payment,
+                            faucet=faucet_payment[1] if faucet_payment and index == 0 else None)
+                          for index, payment in enumerate(payments)]
             await asyncio.gather(*(self.execute(operation) for operation in operations))
             if len(operations) < target:
                 emit("underfilled", target=target, planned=len(operations),
@@ -240,7 +267,8 @@ class Runner:
         last_tip = None
         while not rounds or done < rounds:
             tip = await self.rpc.call("getbestblockhash")
-            if (mode == "controlled" or tip != last_tip) and await self.round(mode, bootstrap):
+            catching_up = self.faucet.tracked and not self.faucet.caught_up
+            if (mode == "controlled" or tip != last_tip or catching_up) and await self.round(mode, bootstrap):
                 done += 1
             last_tip = tip
             if not rounds or done < rounds:
@@ -248,6 +276,7 @@ class Runner:
 
     async def status(self):
         balances = await self.snapshot()
+        await self.sync_faucet()
         for wallet, balance in balances.items():
             emit("balance", wallet=wallet, available_zat=balance["available_zat"],
                  transparent=balance["transparent"], notes=len(balance["notes"]))

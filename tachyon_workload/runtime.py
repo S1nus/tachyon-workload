@@ -13,6 +13,7 @@ import urllib.request
 import uuid
 
 from .planner import FEE
+from .faucet import validate_config as validate_faucet_config
 
 
 def emit(event, **fields):
@@ -48,7 +49,7 @@ def load_config(path):
                     seed_amount_zat=10_000_000, seed_notes=3,
                     weights={"send": 80, "unshield": 8, "shield": 8,
                              "transparent-send": 4})
-    allowed = {*defaults, "rpc_url", "devtool", "wallet_root", "state_dir", "cookie_file"}
+    allowed = {*defaults, "rpc_url", "devtool", "wallet_root", "state_dir", "cookie_file", "faucet"}
     if set(config) - allowed:
         raise ValueError(f"unknown config fields: {sorted(set(config) - allowed)}")
     config = defaults | config
@@ -79,6 +80,8 @@ def load_config(path):
         raise ValueError("weights must contain four payment kinds with nonnegative integer weights")
     if config["max_transactions"] > config["wallet_count"] + 1:
         raise ValueError("cap exceeds one transaction per simulated wallet plus the treasury")
+    if "faucet" in config:
+        config["faucet"] = validate_faucet_config(config["faucet"])
     return config
 
 
@@ -202,12 +205,24 @@ class Journal:
             return None
         return cursor.lastrowid
 
-    def plan(self, round_id, wallet, recipient, args):
+    def plan(self, round_id, wallet, recipient, args, *, faucet=None):
         operation = "workload:" + uuid.uuid4().hex
         with self.db:
             self.db.execute(
                 "INSERT INTO operations(id,round_id,wallet,recipient,args,kind) VALUES (?,?,?,?,?,?)",
                 (operation, round_id, wallet, recipient, json.dumps(args), args[0]))
+            if faucet is not None:
+                policy, amount, purpose = faucet
+                row = self.db.execute("SELECT address FROM faucet_policies WHERE id=?", (policy,)).fetchone()
+                if (wallet != "treasury" or recipient is not None or
+                        row is None or type(amount) is not int or amount < 0 or
+                        purpose not in ("payout", "replenish") or
+                        (purpose == "payout" and (amount == 0 or args !=
+                            ["unshield", "--to", row["address"], "--amount-zat", str(amount)])) or
+                        (purpose == "replenish" and (args[0] != "shield" or amount != 0))):
+                    raise ValueError("faucet accounting must match the journaled treasury payment")
+                self.db.execute("INSERT INTO faucet_operations VALUES(?,?,?,?)",
+                                (operation, policy, amount, purpose))
         return self.get(operation)
 
     def get(self, operation):

@@ -107,6 +107,75 @@ reconstructs proofs from local public inputs and limits closed epochs to 65,536
 tachygrams. Sustained full-block stress testing needs scalable proof evidence,
 more independent inputs, and throughput work beyond this initial sidecar.
 
+## Optional external faucet
+
+Add this section to your workload config, replacing the address with a testnet
+transparent P2PKH or P2SH address from a separate wallet you control:
+
+```toml
+[faucet]
+address = "YOUR_TESTNET_TRANSPARENT_ADDRESS"
+reward_share_bps = 1000
+payout_interval_blocks = 10
+min_payout_zat = 100000
+```
+
+This allocates **10% of each new coinbase reward paid to the treasury**, including
+collected fees but excluding outputs paid to other addresses. Amounts use integer
+zatoshis: `floor(reward_zat * reward_share_bps / 10000)` per block. The percentage
+range is 1–9999 basis points; treasury pays transaction fees separately. The
+faucet's keys never enter the sidecar, and it is never scheduled as a sender.
+
+The first invocation with this configuration records a starting
+height: the next block after the observed tip. It does **not** allocate your old
+treasury balance or historical rewards. Keep the existing journal when restarting;
+the stored height lets the sidecar account for every subsequent block, including
+blocks mined while it was offline. Accounting scans at most 1,000 blocks per round
+and defers new workload payments until it catches up to the treasury's synced tip.
+It reads `getblock` and verbose `getrawtransaction` with an explicit block hash;
+it requires integer `valueZat` outputs and an archive node, not an unspent-only view.
+
+Rewards mature after **100 confirmations**. With a batch size of 10, the first
+batch becomes payable when all ten blocks have matured. Eligible balances can
+be paid over several rounds: devtool spends one note at a time. Mature coinbases
+are shielded in full minus the fee, then Tachyon funds are unshielded to the faucet.
+If a suitable treasury note already exists, it can be used directly. No manual
+note receipt import is needed for the recipient; sync its transparent balance.
+
+Faucet payouts and their shielding transactions count against the existing
+`max_transactions` budget in both live and controlled mode. A sampled zero still
+creates no transactions. Due faucet work gets the treasury slot before simulator
+top-ups; only one treasury operation can be outstanding. Mature unpaid allocations
+and a payout fee are protected from simulator funding, including between batches.
+Payments below `min_payout_zat` remain owed (the minimum configurable threshold is
+50,000 zatoshis). This is per-reward **accounting**, not a promise of a faucet output
+in every block; insufficient liquidity, budget, or an epoch boundary can delay it.
+
+`status` and regular round logs include a `faucet` event with each policy's:
+
+- `immature_zat`: allocated but not mature;
+- `owed_zat`: mature, unpaid, and not already assigned to an in-flight payout;
+- `due_zat`: the portion of that debt eligible under the batch schedule;
+- `in_flight_zat` and `paid_zat`: journaled payouts and confirmed payouts;
+- `credit_zat`: excess payments after a reorg, offset against future allocations
+  to the same recipient, including after rate changes.
+
+`faucet_payment` events distinguish `replenish` from `payout`. Uncertain broadcasts
+retain their signed transaction and operation ID; a retry never invents another
+payment. Reorgs reconcile both reward allocations and payment status.
+
+Changing the address, share, or batching settings creates a new policy **after
+catching up under the old one**. It applies from the next block, not retroactively.
+Old allocations and pending payouts retain their original destination and settings;
+old policies' final partial batches become eligible once mature. Sub-threshold
+remainders remain visible as owed. Removing `[faucet]` stops new allocations and
+new faucet payments after catch-up, but recovery of already-planned payments still
+runs, and old debt stays protected and journaled. Re-enable it to settle that debt.
+
+No Zakura/devtool changes, wallet reset, miner-address change, or chain reset are
+needed. Restart the sidecar after editing its config. Do not create a new journal
+to change settings or retry a payment.
+
 ## Durability and operations
 
 The mode-0700 state directory contains a SQLite journal and confidential receipt
@@ -149,9 +218,11 @@ or miner-address change is needed.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 \
-  python3 -m unittest tachyon_workload.test_workload -v
+  python3 -m unittest discover -s tachyon_workload -t . -v
 ```
 
 Tests cover weighted selection, maturity, coinbase constraints, epoch boundaries,
 zero rounds, private directories, journal locking and chain identity, reorg
 recovery, ambiguous broadcasting/receipt delivery, and mining timeout recovery.
+Faucet tests additionally cover maturity, exact accounting, batching, policy
+changes, reward/payment reorgs, protected funds, and controlled-mode inclusion.
