@@ -45,6 +45,7 @@ def load_config(path):
         config = tomllib.load(file)
     defaults = dict(wallet_count=32, max_transactions=8, concurrency=4,
                     activation_height=8, poll_seconds=2, command_timeout=1800,
+                    allow_external_transactions=False,
                     min_amount_zat=100_000, max_amount_zat=2_000_000,
                     seed_amount_zat=10_000_000, seed_notes=3,
                     weights={"send": 80, "unshield": 8, "shield": 8,
@@ -53,6 +54,8 @@ def load_config(path):
     if set(config) - allowed:
         raise ValueError(f"unknown config fields: {sorted(set(config) - allowed)}")
     config = defaults | config
+    if type(config["allow_external_transactions"]) is not bool:
+        raise ValueError("allow_external_transactions must be true or false")
     for key in ("devtool", "wallet_root", "state_dir"):
         config[key] = (path.parent / config[key]).absolute()
     if config.get("cookie_file"):

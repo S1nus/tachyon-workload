@@ -24,6 +24,16 @@ def fixture():
 
 
 class PlannerTests(unittest.TestCase):
+    def test_external_transactions_option_is_opt_in_and_boolean(self):
+        example = Path(__file__).parent.parent / "config.example.toml"
+        self.assertFalse(load_config(example)["allow_external_transactions"])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.toml"
+            path.write_text(example.read_text().replace(
+                "allow_external_transactions = false", 'allow_external_transactions = "true"'))
+            with self.assertRaisesRegex(ValueError, "must be true or false"):
+                load_config(path)
+
     def test_example_config_keeps_runtime_data_outside_checkout(self):
         config, _, _, _ = fixture()
         checkout = Path(__file__).resolve().parent.parent
@@ -239,6 +249,50 @@ class RunnerTests(unittest.IsolatedAsyncioTestCase):
             await runner.mine_round(record)
         with self.assertRaisesRegex(RuntimeError, "outcome remains ambiguous"):
             await runner.mine_round(record)
+        self.assertEqual(sum(call.args[0] == "generate" for call in runner.rpc.call.await_args_list), 1)
+
+    async def test_external_payment_can_be_mined_in_zero_workload_round(self):
+        runner = self.runner
+        runner.config.update(allow_external_transactions=True, max_transactions=0)
+        runner.network = AsyncMock(return_value=({"blocks": 12, "bestblockhash": "tip"}, "identity"))
+        runner.snapshot = AsyncMock(return_value={})
+        runner.recover = AsyncMock()
+        runner.rpc = AsyncMock()
+        runner.rpc.call.side_effect = ["tip", ["faucet-tx"], ["next"],
+            dict(previousblockhash="tip", tx=["coinbase", "faucet-tx"], height=13, hash="next")]
+        await runner.round("controlled")
+        self.assertFalse(runner.journal.active_rounds())
+        self.assertEqual(sum(call.args[0] == "generate" for call in runner.rpc.call.await_args_list), 1)
+
+    async def test_external_traffic_does_not_allow_missing_workload_payment(self):
+        runner = self.runner
+        runner.config["allow_external_transactions"] = True
+        round_id = runner.journal.new_round("tip", 12, "controlled", 1)
+        operation = runner.journal.plan(round_id, "alice", None, ["shield", "123"])
+        runner.journal.update(operation["id"], status="pending", txid="ours")
+        record = runner.journal.active_rounds()[0]
+        runner.rpc = AsyncMock()
+        runner.rpc.call.side_effect = ["tip", ["faucet-tx"]]
+        with self.assertRaisesRegex(RuntimeError, "mempool differs"):
+            await runner.mine_round(record)
+        runner.rpc.call.side_effect = ["tip", ["ours", "faucet-tx"], ["next"],
+            dict(previousblockhash="tip", tx=["coinbase", "faucet-tx"], height=13, hash="next")]
+        with self.assertRaisesRegex(RuntimeError, "did not match"):
+            await runner.mine_round(record)
+        self.assertTrue(runner.journal.active_rounds())
+
+    async def test_generate_timeout_with_external_traffic_recovers_same_block(self):
+        runner = self.runner
+        runner.config["allow_external_transactions"] = True
+        runner.journal.new_round("tip", 12, "controlled", 0)
+        record = runner.journal.active_rounds()[0]
+        runner.rpc = AsyncMock()
+        runner.rpc.call.side_effect = ["tip", ["faucet-tx"], TimeoutError("response lost"), "next",
+            dict(previousblockhash="tip", tx=["coinbase", "faucet-tx"], height=13, hash="next")]
+        with self.assertRaises(TimeoutError):
+            await runner.mine_round(record)
+        await runner.mine_round(record)
+        self.assertFalse(runner.journal.active_rounds())
         self.assertEqual(sum(call.args[0] == "generate" for call in runner.rpc.call.await_args_list), 1)
 
     async def test_mainnet_rejected_before_wallet_commands(self):

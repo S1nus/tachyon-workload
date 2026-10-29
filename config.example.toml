@@ -11,6 +11,8 @@ max_transactions = 8
 concurrency = 4
 poll_seconds = 2
 command_timeout = 1800
+# Let controlled mining include faucet/user payments alongside its own batch.
+allow_external_transactions = false
 min_amount_zat = 100000
 max_amount_zat = 2000000
 seed_amount_zat = 10000000

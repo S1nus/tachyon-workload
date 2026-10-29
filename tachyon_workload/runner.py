@@ -167,6 +167,12 @@ class Runner:
                 raise RuntimeError("pending operation needs an excluded wallet; restore wallet_count")
             await self.execute(operation)
 
+    def matches_round(self, transactions, expected):
+        actual = set(transactions)
+        # Shared testnets can include faucet/user traffic, but every payment
+        # promised by this round must still be present.
+        return expected <= actual if self.config["allow_external_transactions"] else expected == actual
+
     async def mine_round(self, round_record):
         round_record = next(row for row in self.journal.active_rounds() if row["id"] == round_record["id"])
         tip = await self.rpc.call("getbestblockhash")
@@ -178,12 +184,14 @@ class Runner:
             # A prior generate may have succeeded despite a timeout. Inspect its
             # one successor rather than ever blindly calling generate again.
             successor = await self.rpc.call("getblock", [str(round_record["height"] + 1), 1])
-            if successor["previousblockhash"] != round_record["tip"] or set(successor["tx"][1:]) != expected:
+            if (successor["previousblockhash"] != round_record["tip"] or
+                    not self.matches_round(successor["tx"][1:], expected)):
                 raise RuntimeError("chain advanced outside this round; competing miner or reorg; inspect before resuming")
             self.journal.finish(round_record["id"], successor["hash"])
-            emit("mined_recovered", height=successor["height"], transactions=len(expected))
+            emit("mined_recovered", height=successor["height"], transactions=len(expected),
+                 external_transactions=len(set(successor["tx"][1:]) - expected))
             return
-        if set(await self.rpc.call("getrawmempool")) != expected:
+        if not self.matches_round(await self.rpc.call("getrawmempool"), expected):
             raise RuntimeError("mempool differs from this round; refusing to mine an inaccurate batch")
         if round_record["mining_requested"]:
             raise RuntimeError("generate was already requested but its successor is not visible; "
@@ -192,10 +200,11 @@ class Runner:
         self.journal.request_mining(round_record["id"])
         hashes = await self.rpc.call("generate", [1])
         block = await self.rpc.call("getblock", [hashes[0], 1])
-        if block["previousblockhash"] != round_record["tip"] or set(block["tx"][1:]) != expected:
-            raise RuntimeError("mined block did not contain exactly this round; check competing miners/template policy")
+        if block["previousblockhash"] != round_record["tip"] or not self.matches_round(block["tx"][1:], expected):
+            raise RuntimeError("mined block did not match this round; check competing miners/template policy")
         self.journal.finish(round_record["id"], block["hash"])
-        emit("mined", height=block["height"], transactions=len(expected), target=round_record["target"], hash=block["hash"])
+        emit("mined", height=block["height"], transactions=len(expected), target=round_record["target"], hash=block["hash"],
+             external_transactions=len(set(block["tx"][1:]) - expected))
 
     async def round(self, mode, bootstrap=False):
         await self.network()
@@ -215,7 +224,8 @@ class Runner:
             return True
         info, _ = await self.network()
         tip, height = info["bestblockhash"], info["blocks"]
-        if mode == "controlled" and await self.rpc.call("getrawmempool"):
+        if (mode == "controlled" and not self.config["allow_external_transactions"] and
+                await self.rpc.call("getrawmempool")):
             raise RuntimeError("controlled mode requires an empty mempool before a new round")
         target = 1 if bootstrap else self.rng.randint(0, self.config["max_transactions"])
         round_id = self.journal.new_round(tip, height, mode, target)

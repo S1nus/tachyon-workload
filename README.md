@@ -101,6 +101,15 @@ is recovered by inspecting the persisted round's successor before mining again.
 If no successor is visible yet, it stops rather than guessing whether the server
 is still processing the first request. Investigate the node before resuming.
 
+To share controlled mining with a public faucet or personal wallets, set
+`allow_external_transactions = true` at the top level of the config (before
+`[weights]` or `[faucet]`). It permits outside mempool transactions while still
+requiring every transaction from the workload round to appear in its block.
+Keep the workload as the sole miner. The sampled target now counts only workload
+transactions; a zero round can mine faucet payments. Logs report the extra count
+as `external_transactions`. This option defaults to `false`; live mode already
+allows other traffic. Restart the service after changing the config.
+
 The cap is a **load limit**, not the consensus maximum: block capacity depends on
 serialized size, actions, and validation cost. Start small. Devtool currently
 reconstructs proofs from local public inputs and limits closed epochs to 65,536
